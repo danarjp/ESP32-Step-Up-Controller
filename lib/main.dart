@@ -43,11 +43,19 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   BluetoothDevice? targetDevice;
   BluetoothCharacteristic? rxCharacteristic;
   BluetoothCharacteristic? txCharacteristic;
-  StreamSubscription? scanSub;
-  StreamSubscription? notifySub;
+
+  StreamSubscription<List<ScanResult>>? scanSub;
+  StreamSubscription<List<int>>? notifySub;
+  StreamSubscription<BluetoothConnectionState>? connStateSub;
+  StreamSubscription<BluetoothAdapterState>? adapterSub;
+  Timer? retryScanTimer;
 
   bool isScanning = false;
   bool isConnected = false;
+  bool isConnecting = false;
+  bool manualDisconnect =
+      false; // Mencegah auto-reconnect jika user sengaja tekan "Putus"
+  String connectionStatusText = "Menunggu Bluetooth...";
 
   // Data Telemetri
   double vIn = 0.0;
@@ -57,41 +65,138 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
   bool relayState = false;
   bool isCharging = false;
 
-  void startScan() async {
-    setState(() => isScanning = true);
+  @override
+  void initState() {
+    super.initState();
+    _initAutoBle();
+  }
 
-    await FlutterBluePlus.startScan(timeout: const Duration(seconds: 5));
-    scanSub = FlutterBluePlus.scanResults.listen((results) {
+  // Memantau status Bluetooth HP & otomatis mulai scan saat Bluetooth aktif
+  void _initAutoBle() {
+    adapterSub = FlutterBluePlus.adapterState.listen((state) {
+      if (state == BluetoothAdapterState.on) {
+        if (!isConnected && !manualDisconnect) {
+          startScan();
+        }
+      } else {
+        retryScanTimer?.cancel();
+        if (mounted) {
+          setState(() {
+            isScanning = false;
+            isConnected = false;
+            connectionStatusText = "Bluetooth HP mati. Nyalakan Bluetooth...";
+          });
+        }
+      }
+    });
+  }
+
+  Future<void> startScan() async {
+    if (isScanning || isConnected || isConnecting) return;
+
+    // Pastikan adaptor Bluetooth menyala sebelum scan
+    if (FlutterBluePlus.adapterStateNow != BluetoothAdapterState.on) {
+      if (mounted) {
+        setState(() => connectionStatusText = "Nyalakan Bluetooth HP...");
+      }
+      return;
+    }
+
+    manualDisconnect = false;
+    retryScanTimer?.cancel();
+
+    if (mounted) {
+      setState(() {
+        isScanning = true;
+        connectionStatusText = "Mencari ESP32_POWER_REMOTE secara otomatis...";
+      });
+    }
+
+    await scanSub?.cancel();
+    scanSub = FlutterBluePlus.scanResults.listen((results) async {
       for (ScanResult r in results) {
-        if (r.device.platformName == "ESP32_POWER_REMOTE") {
-          FlutterBluePlus.stopScan();
+        if (r.device.platformName == "ESP32_POWER_REMOTE" ||
+            r.advertisementData.advName == "ESP32_POWER_REMOTE") {
+          await FlutterBluePlus.stopScan();
+          await scanSub?.cancel();
+          retryScanTimer?.cancel();
+          if (mounted) setState(() => isScanning = false);
           connectToDevice(r.device);
           break;
         }
       }
     });
 
-    Future.delayed(const Duration(seconds: 5), () {
-      if (mounted) setState(() => isScanning = false);
+    await FlutterBluePlus.startScan(timeout: const Duration(seconds: 6));
+
+    // Jika dalam 6 detik belum ketemu, ulangi scan otomatis tiap jeda 2 detik
+    retryScanTimer = Timer(const Duration(seconds: 7), () {
+      if (mounted) {
+        setState(() => isScanning = false);
+        if (!isConnected && !isConnecting && !manualDisconnect) {
+          startScan();
+        }
+      }
     });
   }
 
-  void connectToDevice(BluetoothDevice device) async {
+  Future<void> connectToDevice(BluetoothDevice device) async {
+    if (isConnecting || isConnected) return;
+    isConnecting = true;
+
+    if (mounted) {
+      setState(
+        () =>
+            connectionStatusText = "Menghubungkan ke ${device.platformName}...",
+      );
+    }
+
     try {
-      await device.connect();
-      setState(() {
-        targetDevice = device;
-        isConnected = true;
-        isScanning = false;
+      await device.connect(autoConnect: false);
+
+      // Pantau status koneksi agar otomatis scan ulang jika terputus tiba-tiba
+      await connStateSub?.cancel();
+      connStateSub = device.connectionState.listen((state) {
+        if (state == BluetoothConnectionState.disconnected) {
+          notifySub?.cancel();
+          if (mounted) {
+            setState(() {
+              isConnected = false;
+              isConnecting = false;
+              targetDevice = null;
+              rxCharacteristic = null;
+              txCharacteristic = null;
+              relayState = false;
+              connectionStatusText = manualDisconnect
+                  ? "Diputus secara manual"
+                  : "Terputus. Mencari ulang otomatis...";
+            });
+          }
+          if (!manualDisconnect) {
+            Future.delayed(const Duration(seconds: 1), () => startScan());
+          }
+        }
       });
+
+      if (mounted) {
+        setState(() {
+          targetDevice = device;
+          isConnected = true;
+          isConnecting = false;
+          isScanning = false;
+          connectionStatusText = device.platformName;
+        });
+      }
 
       List<BluetoothService> services = await device.discoverServices();
       for (var service in services) {
-        if (service.uuid.toString() == serviceUuid) {
+        if (service.uuid.toString().toLowerCase() ==
+            serviceUuid.toLowerCase()) {
           for (var c in service.characteristics) {
-            if (c.uuid.toString() == rxUuid) {
+            if (c.uuid.toString().toLowerCase() == rxUuid.toLowerCase()) {
               rxCharacteristic = c;
-            } else if (c.uuid.toString() == txUuid) {
+            } else if (c.uuid.toString().toLowerCase() ==
+                txUuid.toLowerCase()) {
               txCharacteristic = c;
               await txCharacteristic!.setNotifyValue(true);
               notifySub = txCharacteristic!.lastValueStream.listen((data) {
@@ -103,13 +208,21 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
       }
     } catch (e) {
       debugPrint("Gagal konek: $e");
+      isConnecting = false;
+      if (mounted && !manualDisconnect) {
+        setState(() {
+          isConnected = false;
+          connectionStatusText = "Gagal konek, mencoba scan ulang...";
+        });
+        Future.delayed(const Duration(seconds: 2), () => startScan());
+      }
     }
   }
 
   void parseTelemetry(String data) {
     // Format: Vin, Vout, Vbat, BatPct, RelayState, IsCharging
     List<String> parts = data.split(',');
-    if (parts.length >= 6) {
+    if (parts.length >= 6 && mounted) {
       setState(() {
         vIn = double.tryParse(parts[0]) ?? 0.0;
         vOut = double.tryParse(parts[1]) ?? 0.0;
@@ -121,26 +234,40 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
     }
   }
 
-  void sendCommand(String cmd) async {
-    if (rxCharacteristic != null) {
+  Future<void> sendCommand(String cmd) async {
+    if (rxCharacteristic != null && isConnected) {
       await rxCharacteristic!.write(utf8.encode(cmd));
     }
   }
 
-  void disconnectDevice() async {
-    notifySub?.cancel();
-    scanSub?.cancel();
+  Future<void> disconnectDevice() async {
+    manualDisconnect = true;
+    retryScanTimer?.cancel();
+    await notifySub?.cancel();
+    await scanSub?.cancel();
+    await FlutterBluePlus.stopScan();
     await targetDevice?.disconnect();
-    setState(() {
-      isConnected = false;
-      targetDevice = null;
-    });
+
+    if (mounted) {
+      setState(() {
+        isConnected = false;
+        isScanning = false;
+        isConnecting = false;
+        targetDevice = null;
+        connectionStatusText =
+            "Diputus secara manual. Tekan Scan untuk sambung.";
+      });
+    }
   }
 
   @override
   void dispose() {
+    retryScanTimer?.cancel();
     notifySub?.cancel();
     scanSub?.cancel();
+    connStateSub?.cancel();
+    adapterSub?.cancel();
+    targetDevice?.disconnect();
     super.dispose();
   }
 
@@ -178,13 +305,13 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
                   size: 32,
                 ),
                 title: Text(isConnected ? "Terhubung ke ESP32" : "Terputus"),
-                subtitle: Text(
-                  isConnected
-                      ? targetDevice!.platformName
-                      : "Tekan scan untuk menghubungkan",
-                ),
+                subtitle: Text(connectionStatusText),
                 trailing: isScanning
-                    ? const CircularProgressIndicator()
+                    ? const SizedBox(
+                        width: 24,
+                        height: 24,
+                        child: CircularProgressIndicator(strokeWidth: 2.5),
+                      )
                     : ElevatedButton(
                         onPressed: isConnected ? disconnectDevice : startScan,
                         child: Text(isConnected ? "Putus" : "Scan"),
@@ -245,7 +372,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
               children: [
                 Expanded(
                   child: _buildMetricCard(
-                    "INPUT VOLT",
+                    "INPUT POWER UP",
                     "${vIn.toStringAsFixed(1)} V",
                     Icons.bolt,
                     Colors.orangeAccent,
@@ -254,7 +381,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
                 const SizedBox(width: 12),
                 Expanded(
                   child: _buildMetricCard(
-                    "OUTPUT VOLT",
+                    "OUTPUT POWER UP",
                     "${vOut.toStringAsFixed(1)} V",
                     Icons.speed,
                     Colors.cyanAccent,
@@ -311,7 +438,7 @@ class _RemoteHomePageState extends State<RemoteHomePage> {
                     if (isCharging) ...[
                       const SizedBox(height: 8),
                       const Text(
-                        "Auto-Charging Aktif (<30%)",
+                        "Auto-Charging Aktif (<85%)",
                         style: TextStyle(
                           fontSize: 11,
                           color: Colors.greenAccent,
